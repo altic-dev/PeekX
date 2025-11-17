@@ -1,456 +1,977 @@
-//
-//  PreviewViewController.swift
-//  PeekX QuickLook
-//
-//  Created by PeekX
-//
+// PeekX - Folder Preview Extension for macOS
+// Copyright © 2025. All rights reserved.
 
 import Cocoa
 import Quartz
 import UniformTypeIdentifiers
-import WebKit
+import QuickLook
 
+// MARK: - Debug Logger
+final class DebugLogger {
+    static let shared = DebugLogger()
+    
+    private let fileURL: URL
+    private let queue = DispatchQueue(label: "com.peekx.logger", qos: .utility)
+    private let formatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private let maxSize: UInt64 = 256 * 1024 // 256 KB
+    
+    private init() {
+        let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        fileURL = temp.appendingPathComponent("PeekXExt.log")
+    }
+    
+    func log(_ message: String) {
+        let timestamp = formatter.string(from: Date())
+        let entry = "[\(timestamp)] \(message)\n"
+        queue.async {
+            if let data = entry.data(using: .utf8) {
+                self.append(data)
+            }
+            NSLog(message)
+        }
+    }
+    
+    func locationDescription() -> String { fileURL.path }
+    
+    private func append(_ data: Data) {
+        do {
+            if FileManager.default.fileExists(atPath: fileURL.path) == false {
+                try data.write(to: fileURL, options: .atomic)
+            } else {
+                let handle = try FileHandle(forWritingTo: fileURL)
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+                try handle.close()
+            }
+            pruneIfNeeded()
+        } catch {
+            NSLog("PeekX logger error: \(error.localizedDescription)")
+        }
+    }
+    
+    private func pruneIfNeeded() {
+        guard
+            let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+            let size = attributes[.size] as? UInt64,
+            size > maxSize
+        else { return }
+        
+        if let data = try? Data(contentsOf: fileURL) {
+            let trimmed = data.suffix(Int(maxSize / 2))
+            try? trimmed.write(to: fileURL, options: .atomic)
+        }
+    }
+}
+
+// MARK: - Custom Outline View
+
+/// Protocol for handling keyboard events in the outline view
+protocol FinderOutlineViewKeyboardDelegate: AnyObject {
+    func outlineView(_ outlineView: FinderOutlineView, handle event: NSEvent) -> Bool
+}
+
+/// Custom outline view that intercepts keyboard events for QuickLook-specific shortcuts
+final class FinderOutlineView: NSOutlineView {
+    weak var keyboardDelegate: FinderOutlineViewKeyboardDelegate?
+    
+    override var acceptsFirstResponder: Bool { true }
+    override var needsPanelToBecomeKey: Bool { false }
+    
+    override func keyDown(with event: NSEvent) {
+        if keyboardDelegate?.outlineView(self, handle: event) == true {
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+
+// MARK: - File Item Model
+
+/// Represents a file or folder in the preview hierarchy
+final class FileItem: NSObject, QLPreviewItem {
+    let url: URL
+    let name: String
+    let isFolder: Bool
+    let size: Int64
+    let modificationDate: Date
+    let contentType: UTType?
+    weak var parent: FileItem?
+    var icon: NSImage?
+    var children: [FileItem]?
+    var childrenLoaded = false
+    
+    init(url: URL, resourceValues: URLResourceValues, parent: FileItem? = nil) {
+        self.url = url
+        self.name = url.lastPathComponent
+        self.isFolder = resourceValues.isDirectory ?? false
+        self.size = Int64(resourceValues.fileSize ?? 0)
+        self.modificationDate = resourceValues.contentModificationDate ?? Date()
+        self.contentType = resourceValues.contentType
+        self.parent = parent
+        super.init()
+    }
+    
+    var kindDescription: String {
+        isFolder ? "Folder" : (contentType?.localizedDescription ?? "File")
+    }
+    
+    func setChildren(_ children: [FileItem]) {
+        self.children = children
+        self.childrenLoaded = true
+        for child in children {
+            child.parent = self
+        }
+    }
+    
+    func resetChildren() {
+        children = nil
+        childrenLoaded = false
+    }
+    
+    var previewItemURL: URL? { url }
+    var previewItemTitle: String { name }
+}
+
+// MARK: - Preview View Controller
+
+/// Main view controller for the QuickLook folder preview extension
 @objc(PreviewViewController)
-class PreviewViewController: NSViewController, QLPreviewingController {
+final class PreviewViewController: NSViewController, QLPreviewingController {
     
-    private var webView: WKWebView!
-    private var iconCache: [String: String] = [:]
+    // MARK: - Filter Types
     
-    override init(nibName nibNameOrNil: NSNib.Name?, bundle nibBundleOrNil: Bundle?) {
-        super.init(nibName: nibNameOrNil, bundle: nibBundleOrNil)
-        NSLog("🎯 PeekX: PreviewViewController initialized!")
-    }
-    
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        NSLog("🎯 PeekX: PreviewViewController initialized from coder!")
-    }
-    
-    override func loadView() {
-        NSLog("🎯 PeekX: loadView called!")
+    private enum FilterType: Int {
+        case all, folders, images, documents, media
         
-        // Create a simple view
-        let containerView = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
-        
-        // Create WebView for displaying HTML
-        webView = WKWebView(frame: containerView.bounds)
-        webView.autoresizingMask = [.width, .height]
-        
-        containerView.addSubview(webView)
-        
-        self.view = containerView
-        NSLog("🎯 PeekX: View created with WebView!")
-    }
-    
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        NSLog("🎯 PeekX: ViewDidLoad called!")
-    }
-    
-    // MARK: - QLPreviewingController Protocol
-    
-    func preparePreviewOfFile(at url: URL, completionHandler handler: @escaping (Error?) -> Void) {
-        NSLog("🚀 PeekX: preparePreviewOfFile CALLED!")
-        NSLog("🔍 PeekX: URL: \(url.path)")
-        
-        let folderName = url.lastPathComponent
-        NSLog("📂 PeekX: Folder name: \(folderName)")
-        
-        // Enumerate files in background
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let fileManager = FileManager.default
-                let contents = try fileManager.contentsOfDirectory(
-                    at: url,
-                    includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey],
-                    options: [.skipsHiddenFiles]
-                )
-                
-                // Sort: folders first, then alphabetically
-                let sortedContents = contents.sorted { item1, item2 in
-                    let isDir1 = (try? item1.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-                    let isDir2 = (try? item2.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-                    
-                    if isDir1 != isDir2 {
-                        return isDir1  // Folders first
-                    }
-                    return item1.lastPathComponent.localizedStandardCompare(item2.lastPathComponent) == .orderedAscending
+        func matches(_ item: FileItem) -> Bool {
+            switch self {
+            case .all:
+                return true
+            case .folders:
+                return item.isFolder
+            case .images:
+                return item.contentType?.conforms(to: .image) ?? false
+            case .documents:
+                if item.isFolder { return false }
+                if let type = item.contentType {
+                    if type.conforms(to: .image) || type.conforms(to: .audiovisualContent) { return false }
                 }
-                
-                // Performance optimization: use array instead of string concatenation
-                var fileRowsArray: [String] = []
-                fileRowsArray.reserveCapacity(min(sortedContents.count, 500))
-                
-                var totalSize: Int64 = 0
-                let itemCount = contents.count
-                var folderCount = 0
-                var fileCount = 0
-                
-                // Quick pass to calculate stats and build data
-                var itemsData: [(name: String, isFolder: Bool, size: Int64, date: String, kind: String, path: String)] = []
-                
-                for itemURL in sortedContents.prefix(500) {
-                    let name = itemURL.lastPathComponent
-                    let resourceValues = try itemURL.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey])
-                    let isFolder = resourceValues.isDirectory ?? false
-                    let size = Int64(resourceValues.fileSize ?? 0)
-                    let modDate = resourceValues.contentModificationDate ?? Date()
-                    
-                    if isFolder {
-                        folderCount += 1
-                    } else {
-                        fileCount += 1
-                        totalSize += size
-                    }
-                    
-                    let sizeText = isFolder ? "—" : self.formatBytes(size)
-                    let kindText = isFolder ? "Folder" : (resourceValues.contentType?.localizedDescription ?? "File")
-                    let dateText = self.formatDate(modDate)
-                    
-                    itemsData.append((
-                        name: name,
-                        isFolder: isFolder,
-                        size: size,
-                        date: dateText,
-                        kind: kindText,
-                        path: itemURL.path
-                    ))
-                }
-                
-                // Use placeholder icons for initial render (FAST!)
-                let placeholderFolder = "📁"
-                let placeholderFile = "📄"
-                
-                for item in itemsData {
-                    let placeholder = item.isFolder ? placeholderFolder : placeholderFile
-                    fileRowsArray.append("""
-                    <tr data-path="\(item.path)" data-isfolder="\(item.isFolder)">
-                        <td><span class="icon-placeholder">\(placeholder)</span> \(item.name)</td>
-                        <td>\(item.date)</td>
-                        <td>\(item.isFolder ? "—" : self.formatBytes(item.size))</td>
-                        <td>\(item.kind)</td>
-                    </tr>
-                    """)
-                }
-                
-                let fileRows = fileRowsArray.joined()
-                
-                // Get folder icon for header (only this one upfront)
-                let folderIconURL = self.getCachedIconDataURL(for: url, isFolder: true)
-                
-                NSLog("📊 PeekX: Found \(itemCount) items (\(folderCount) folders, \(fileCount) files)")
-                
-                // Better info text with file/folder breakdown
-                let infoText = "\(self.formatBytes(totalSize)) · \(folderCount) folders, \(fileCount) files"
-                let limitWarning = itemCount > 500 ? "<div class=\"footer\">Showing first 500 of \(itemCount) items</div>" : ""
-                
-                let html = """
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <meta charset="UTF-8">
-                    <style>
-                        * { margin: 0; padding: 0; box-sizing: border-box; }
-                        body {
-                            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', sans-serif;
-                            background: #ffffff;
-                            color: #000000;
-                            margin: 0;
-                            padding: 16px;
-                        }
-                        .header {
-                            display: flex;
-                            align-items: center;
-                            gap: 12px;
-                            margin-bottom: 16px;
-                            padding: 8px 0;
-                            border-bottom: 1px solid #e5e5e5;
-                        }
-                        .header img { width: 32px; height: 32px; }
-                        .header .title { 
-                            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif;
-                            font-size: 20px; 
-                            font-weight: 600; 
-                            color: #000;
-                            letter-spacing: -0.02em;
-                        }
-                        .header .info { font-size: 13px; color: #86868b; }
-                        table { 
-                            width: 100%; 
-                            border-collapse: collapse;
-                            border-radius: 6px;
-                            overflow: hidden;
-                        }
-                        th {
-                            background: #fafafa;
-                            padding: 6px 12px;
-                            text-align: left;
-                            font-size: 11px;
-                            font-weight: 600;
-                            color: #86868b;
-                            border-bottom: 1px solid #e5e5e5;
-                            text-transform: uppercase;
-                            letter-spacing: 0.5px;
-                            cursor: pointer;
-                            user-select: none;
-                            position: relative;
-                            transition: background-color 0.15s ease;
-                        }
-                        th:hover {
-                            background: #f0f0f0;
-                        }
-                        th.sorted-asc::after {
-                            content: ' ▲';
-                            font-size: 9px;
-                            color: #007aff;
-                        }
-                        th.sorted-desc::after {
-                            content: ' ▼';
-                            font-size: 9px;
-                            color: #007aff;
-                        }
-                        td {
-                            padding: 6px 12px;
-                            font-size: 13px;
-                            line-height: 1.5;
-                            border-bottom: 1px solid #f5f5f5;
-                        }
-                        td:nth-child(3) {
-                            text-align: right;
-                            font-variant-numeric: tabular-nums;
-                        }
-                        td img { 
-                            vertical-align: middle; 
-                            margin-right: 8px;
-                            display: inline-block;
-                        }
-                        .icon-placeholder {
-                            display: inline-block;
-                            width: 16px;
-                            text-align: center;
-                            font-size: 14px;
-                            margin-right: 8px;
-                        }
-                        tbody tr {
-                            transition: background-color 0.15s ease;
-                        }
-                        tbody tr:nth-child(even) { background: #fafafa; }
-                        tbody tr:hover { 
-                            background: #e8f2fe;
-                            box-shadow: inset 0 0 0 1px rgba(0, 122, 255, 0.2);
-                        }
-                        .footer {
-                            text-align: center;
-                            padding: 16px;
-                            color: #86868b;
-                            font-size: 13px;
-                        }
-                        
-                        /* Dark mode support */
-                        @media (prefers-color-scheme: dark) {
-                            body {
-                                background: #1e1e1e;
-                                color: #ffffff;
-                            }
-                            .header {
-                                border-bottom: 1px solid #3a3a3a;
-                            }
-                            .header .title {
-                                color: #ffffff;
-                            }
-                            .header .info {
-                                color: #98989d;
-                            }
-                            th {
-                                background: #2a2a2a;
-                                color: #98989d;
-                                border-bottom: 1px solid #3a3a3a;
-                            }
-                            th:hover {
-                                background: #353535;
-                            }
-                            td {
-                                border-bottom: 1px solid #2a2a2a;
-                            }
-                            tbody tr:nth-child(even) {
-                                background: #252525;
-                            }
-                            tbody tr:hover {
-                                background: #37474f;
-                                box-shadow: inset 0 0 0 1px rgba(100, 150, 200, 0.3);
-                            }
-                            .footer {
-                                color: #98989d;
-                            }
-                        }
-                    </style>
-                </head>
-                <body>
-                    <div class="header">
-                        <img src="\(folderIconURL)" width="32" height="32">
-                        <div>
-                            <div class="title">\(folderName)</div>
-                            <div class="info">\(infoText)</div>
-                        </div>
-                    </div>
-                    <table id="fileTable">
-                        <thead>
-                            <tr>
-                                <th onclick="sortTable(0)" class="sorted-asc">Name</th>
-                                <th onclick="sortTable(1)">Date Modified</th>
-                                <th onclick="sortTable(2)">Size</th>
-                                <th onclick="sortTable(3)">Kind</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            \(fileRows)
-                        </tbody>
-                    </table>
-                    \(limitWarning)
-                    
-                    <script>
-                    let currentSort = { column: 0, ascending: true };
-                    
-                    function sortTable(columnIndex) {
-                        const table = document.getElementById('fileTable');
-                        const tbody = table.querySelector('tbody');
-                        const rows = Array.from(tbody.querySelectorAll('tr'));
-                        
-                        // Toggle sort direction if clicking same column
-                        if (currentSort.column === columnIndex) {
-                            currentSort.ascending = !currentSort.ascending;
-                        } else {
-                            currentSort.column = columnIndex;
-                            currentSort.ascending = true;
-                        }
-                        
-                        // Remove all sort indicators
-                        table.querySelectorAll('th').forEach(th => {
-                            th.classList.remove('sorted-asc', 'sorted-desc');
-                        });
-                        
-                        // Add sort indicator to clicked column
-                        const clickedHeader = table.querySelectorAll('th')[columnIndex];
-                        clickedHeader.classList.add(currentSort.ascending ? 'sorted-asc' : 'sorted-desc');
-                        
-                        // Add animation during sort
-                        tbody.style.transition = 'opacity 0.1s ease';
-                        tbody.style.opacity = '0.7';
-                        
-                        // Sort rows
-                        rows.sort((a, b) => {
-                            let aVal = a.cells[columnIndex].textContent.trim();
-                            let bVal = b.cells[columnIndex].textContent.trim();
-                            
-                            // Special handling for different columns
-                            if (columnIndex === 0) { // Name - ignore icon
-                                aVal = aVal.substring(aVal.indexOf(' ') + 1);
-                                bVal = bVal.substring(bVal.indexOf(' ') + 1);
-                                return currentSort.ascending ? 
-                                    aVal.localeCompare(bVal, undefined, {numeric: true, sensitivity: 'base'}) :
-                                    bVal.localeCompare(aVal, undefined, {numeric: true, sensitivity: 'base'});
-                            } else if (columnIndex === 1) { // Date
-                                const aDate = new Date(aVal);
-                                const bDate = new Date(bVal);
-                                return currentSort.ascending ? aDate - bDate : bDate - aDate;
-                            } else if (columnIndex === 2) { // Size
-                                const aSize = parseSize(aVal);
-                                const bSize = parseSize(bVal);
-                                return currentSort.ascending ? aSize - bSize : bSize - aSize;
-                            } else { // Kind
-                                return currentSort.ascending ? 
-                                    aVal.localeCompare(bVal) : 
-                                    bVal.localeCompare(aVal);
-                            }
-                        });
-                        
-                        // Re-append rows in sorted order
-                        rows.forEach(row => tbody.appendChild(row));
-                        
-                        // Restore opacity after sort
-                        setTimeout(() => {
-                            tbody.style.opacity = '1';
-                        }, 50);
-                    }
-                    
-                    function parseSize(sizeStr) {
-                        if (sizeStr === '—') return -1; // Folders come first when sorting by size ascending
-                        
-                        const units = { 'bytes': 1, 'KB': 1024, 'MB': 1024*1024, 'GB': 1024*1024*1024 };
-                        const match = sizeStr.match(/([\\d,.]+)\\s*(\\w+)/);
-                        if (!match) return 0;
-                        
-                        const value = parseFloat(match[1].replace(',', ''));
-                        const unit = match[2];
-                        return value * (units[unit] || 1);
-                    }
-                    </script>
-                </body>
-                </html>
-                """
-                
-                // Load HTML on main thread
-                DispatchQueue.main.async {
-                    self.webView.loadHTMLString(html, baseURL: nil)
-                    NSLog("✅ PeekX: HTML loaded with file list!")
-                    handler(nil)
-                }
-                
-            } catch {
-                NSLog("❌ PeekX: Error reading folder: \(error)")
-                handler(error)
+                return true
+            case .media:
+                return item.contentType?.conforms(to: .audiovisualContent) ?? false
             }
         }
     }
     
-    // MARK: - Helper Methods
+    // MARK: - UI Components
     
-    private func getCachedIconDataURL(for url: URL, isFolder: Bool) -> String {
-        // Create cache key based on file extension or folder
-        let cacheKey: String
-        if isFolder {
-            cacheKey = "__folder__"
-        } else {
-            cacheKey = url.pathExtension.lowercased().isEmpty ? "__file__" : url.pathExtension.lowercased()
-        }
-        
-        // Return cached icon if available
-        if let cached = iconCache[cacheKey] {
-            return cached
-        }
-        
-        // Generate and cache
-        let iconURL = getIconDataURL(for: url)
-        iconCache[cacheKey] = iconURL
-        return iconURL
-    }
+    private var scrollView: NSScrollView!
+    private var splitView: NSSplitView!
+    private var outlineView: FinderOutlineView!
+    private var headerView: NSView!
+    private var iconImageView: NSImageView!
+    private var titleLabel: NSTextField!
+    private var infoLabel: NSTextField!
+    private var filterControl: NSSegmentedControl!
+    private var previewPane: NSView!
+    private var pathBarView: NSView!
+    private var pathControl: NSPathControl!
+    private var previewImageView: NSImageView!
+    private var previewSpinner: NSProgressIndicator!
+    private var previewTitleLabel: NSTextField!
+    private var previewInfoLabel: NSTextField!
+    private var previewMessageLabel: NSTextField!
     
-    private func getIconDataURL(for url: URL) -> String {
-        let icon = NSWorkspace.shared.icon(forFile: url.path)
-        icon.size = NSSize(width: 16, height: 16)
-        
-        guard let tiffData = icon.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffData),
-              let pngData = bitmap.representation(using: .png, properties: [:]) else {
-            return ""
-        }
-        
-        let base64 = pngData.base64EncodedString()
-        return "data:image/png;base64,\(base64)"
-    }
+    // MARK: - Data State
     
-    private func formatBytes(_ bytes: Int64) -> String {
+    private var rootItems: [FileItem] = []
+    private var filterType: FilterType = .all
+    private var currentSortDescriptor: NSSortDescriptor? = NSSortDescriptor(key: "name", ascending: true, selector: #selector(NSString.localizedStandardCompare(_:)))
+    private var visibleRootItems: [FileItem] = []
+    private var previewedItem: FileItem?
+    private var previewImageLoadTask: DispatchWorkItem?
+    private var previewRootURL: URL?
+    private var didSetInitialSplitPosition = false
+    
+    // MARK: - Formatters
+    
+    private lazy var byteFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
         formatter.allowedUnits = [.useKB, .useMB, .useGB]
         formatter.countStyle = .file
-        return formatter.string(fromByteCount: bytes)
-    }
+        return formatter
+    }()
     
-    private func formatDate(_ date: Date) -> String {
+    private lazy var dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
         formatter.doesRelativeDateFormatting = true
-        return formatter.string(from: date)
+        return formatter
+    }()
+    
+    // MARK: - View Lifecycle
+    
+    override func loadView() {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
+        container.translatesAutoresizingMaskIntoConstraints = false
+        
+        headerView = createHeaderView()
+        let controlsStack = createControlsStack()
+        scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        
+        outlineView = FinderOutlineView()
+        outlineView.translatesAutoresizingMaskIntoConstraints = false
+        outlineView.delegate = self
+        outlineView.dataSource = self
+        outlineView.usesAlternatingRowBackgroundColors = true
+        outlineView.headerView = NSTableHeaderView()
+        outlineView.focusRingType = .none
+        outlineView.selectionHighlightStyle = .regular
+        outlineView.rowSizeStyle = .default
+        outlineView.allowsColumnReordering = false
+        outlineView.allowsColumnResizing = true
+        outlineView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        outlineView.keyboardDelegate = self
+        outlineView.menu = contextMenu
+        outlineView.menu?.delegate = self
+        
+        scrollView.documentView = outlineView
+        
+        splitView = NSSplitView()
+        splitView.translatesAutoresizingMaskIntoConstraints = false
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.addArrangedSubview(scrollView)
+        previewPane = createPreviewPane()
+        splitView.addArrangedSubview(previewPane)
+        splitView.setHoldingPriority(.defaultLow, forSubviewAt: 0)
+        splitView.setHoldingPriority(.defaultHigh, forSubviewAt: 1)
+        splitView.arrangedSubviews[0].widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
+        splitView.arrangedSubviews[1].widthAnchor.constraint(greaterThanOrEqualToConstant: 340).isActive = true
+        
+        pathBarView = createPathBar()
+        
+        container.addSubview(headerView)
+        container.addSubview(controlsStack)
+        container.addSubview(pathBarView)
+        container.addSubview(splitView)
+        
+        NSLayoutConstraint.activate([
+            headerView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            headerView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            headerView.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
+            
+            controlsStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            controlsStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            controlsStack.topAnchor.constraint(equalTo: headerView.bottomAnchor, constant: 12),
+            
+            pathBarView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            pathBarView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            pathBarView.topAnchor.constraint(equalTo: controlsStack.bottomAnchor, constant: 8),
+            pathBarView.heightAnchor.constraint(equalToConstant: 26),
+            
+            splitView.topAnchor.constraint(equalTo: pathBarView.bottomAnchor, constant: 8),
+            splitView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            splitView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            splitView.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16)
+        ])
+        
+        createColumns()
+        updatePreview(for: nil)
+        self.view = container
+    }
+    
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        outlineView.window?.makeFirstResponder(outlineView)
+    }
+    
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        if !didSetInitialSplitPosition {
+            didSetInitialSplitPosition = true
+            setDefaultSplitPosition()
+        }
+    }
+    
+    // MARK: - UI Builders
+    private func createHeaderView() -> NSView {
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        
+        iconImageView = NSImageView()
+        iconImageView.translatesAutoresizingMaskIntoConstraints = false
+        iconImageView.imageScaling = .scaleProportionallyDown
+        
+        titleLabel = NSTextField(labelWithString: "")
+        titleLabel.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        
+        infoLabel = NSTextField(labelWithString: "")
+        infoLabel.font = NSFont.systemFont(ofSize: 13)
+        infoLabel.textColor = .secondaryLabelColor
+        infoLabel.translatesAutoresizingMaskIntoConstraints = false
+        
+        view.addSubview(iconImageView)
+        view.addSubview(titleLabel)
+        view.addSubview(infoLabel)
+        
+        NSLayoutConstraint.activate([
+            iconImageView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            iconImageView.topAnchor.constraint(equalTo: view.topAnchor),
+            iconImageView.widthAnchor.constraint(equalToConstant: 48),
+            iconImageView.heightAnchor.constraint(equalToConstant: 48),
+            
+            titleLabel.leadingAnchor.constraint(equalTo: iconImageView.trailingAnchor, constant: 12),
+            titleLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 4),
+            titleLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            
+            infoLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            infoLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+            infoLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            infoLabel.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -4)
+        ])
+        
+        return view
+    }
+    
+    private func createControlsStack() -> NSStackView {
+        filterControl = NSSegmentedControl(labels: ["All", "Folders", "Images", "Docs", "Media"], trackingMode: .selectOne, target: self, action: #selector(filterChanged(_:)))
+        filterControl.selectedSegment = FilterType.all.rawValue
+        filterControl.translatesAutoresizingMaskIntoConstraints = false
+        
+        let stack = NSStackView(views: [filterControl])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 8
+        
+        NSLayoutConstraint.activate([
+            filterControl.widthAnchor.constraint(equalToConstant: 320)
+        ])
+        
+        return stack
+    }
+    
+    private func setDefaultSplitPosition() {
+        view.layoutSubtreeIfNeeded()
+        let totalWidth = splitView.bounds.width
+        guard totalWidth > 0 else { return }
+        let previewMin: CGFloat = 360
+        let outlineMin: CGFloat = 320
+        let desiredLeft = max(outlineMin, min(totalWidth - previewMin, totalWidth * 0.4))
+        splitView.setPosition(desiredLeft, ofDividerAt: 0)
+    }
+    
+    private func createColumns() {
+        outlineView.tableColumns.forEach { outlineView.removeTableColumn($0) }
+        
+        let nameColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
+        nameColumn.title = "Name"
+        nameColumn.minWidth = 250
+        nameColumn.width = 380
+        nameColumn.sortDescriptorPrototype = NSSortDescriptor(key: "name", ascending: true, selector: #selector(NSString.localizedStandardCompare(_:)))
+        outlineView.addTableColumn(nameColumn)
+        outlineView.outlineTableColumn = nameColumn
+        
+        let dateColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("date"))
+        dateColumn.title = "Date Modified"
+        dateColumn.minWidth = 160
+        dateColumn.width = 200
+        dateColumn.sortDescriptorPrototype = NSSortDescriptor(key: "date", ascending: false)
+        outlineView.addTableColumn(dateColumn)
+        
+        let sizeColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("size"))
+        sizeColumn.title = "Size"
+        sizeColumn.minWidth = 80
+        sizeColumn.width = 120
+        sizeColumn.sortDescriptorPrototype = NSSortDescriptor(key: "size", ascending: false)
+        outlineView.addTableColumn(sizeColumn)
+        
+        let kindColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("kind"))
+        kindColumn.title = "Kind"
+        kindColumn.minWidth = 140
+        kindColumn.width = 180
+        kindColumn.sortDescriptorPrototype = NSSortDescriptor(key: "kind", ascending: true)
+        outlineView.addTableColumn(kindColumn)
+    }
+    
+    private func createPreviewPane() -> NSView {
+        let pane = NSView()
+        pane.translatesAutoresizingMaskIntoConstraints = false
+        
+        let stack = NSStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.spacing = 12
+        stack.alignment = .leading
+        
+        let imageContainer = NSView()
+        imageContainer.translatesAutoresizingMaskIntoConstraints = false
+        imageContainer.wantsLayer = true
+        imageContainer.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        imageContainer.layer?.cornerRadius = 8
+        imageContainer.layer?.masksToBounds = true
+        
+        previewImageView = NSImageView()
+        previewImageView.translatesAutoresizingMaskIntoConstraints = false
+        previewImageView.imageScaling = .scaleProportionallyUpOrDown
+        previewImageView.imageAlignment = .alignCenter
+        
+        previewSpinner = NSProgressIndicator()
+        previewSpinner.translatesAutoresizingMaskIntoConstraints = false
+        previewSpinner.style = .spinning
+        previewSpinner.controlSize = .large
+        previewSpinner.isDisplayedWhenStopped = false
+        
+        imageContainer.addSubview(previewImageView)
+        imageContainer.addSubview(previewSpinner)
+        
+        let flexibleWidth = imageContainer.widthAnchor.constraint(equalToConstant: 0)
+        flexibleWidth.priority = .defaultLow
+        NSLayoutConstraint.activate([
+            previewImageView.leadingAnchor.constraint(equalTo: imageContainer.leadingAnchor),
+            previewImageView.trailingAnchor.constraint(equalTo: imageContainer.trailingAnchor),
+            previewImageView.topAnchor.constraint(equalTo: imageContainer.topAnchor),
+            previewImageView.bottomAnchor.constraint(equalTo: imageContainer.bottomAnchor),
+            
+            previewSpinner.centerXAnchor.constraint(equalTo: imageContainer.centerXAnchor),
+            previewSpinner.centerYAnchor.constraint(equalTo: imageContainer.centerYAnchor),
+            
+            imageContainer.heightAnchor.constraint(equalToConstant: 340),
+            flexibleWidth
+        ])
+        
+        previewTitleLabel = NSTextField(labelWithString: "No Selection")
+        previewTitleLabel.font = NSFont.systemFont(ofSize: 17, weight: .semibold)
+        previewTitleLabel.lineBreakMode = .byTruncatingTail
+        
+        previewInfoLabel = NSTextField(labelWithString: "Select a file to preview.")
+        previewInfoLabel.font = NSFont.systemFont(ofSize: 12)
+        previewInfoLabel.textColor = .secondaryLabelColor
+        previewInfoLabel.lineBreakMode = .byWordWrapping
+        
+        previewMessageLabel = NSTextField(labelWithString: "")
+        previewMessageLabel.font = NSFont.systemFont(ofSize: 12)
+        previewMessageLabel.textColor = .tertiaryLabelColor
+        previewMessageLabel.lineBreakMode = .byWordWrapping
+        previewMessageLabel.isHidden = true
+        
+        stack.addArrangedSubview(imageContainer)
+        stack.addArrangedSubview(previewTitleLabel)
+        stack.addArrangedSubview(previewInfoLabel)
+        stack.addArrangedSubview(previewMessageLabel)
+        stack.setCustomSpacing(4, after: previewTitleLabel)
+        
+        pane.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: pane.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: pane.bottomAnchor)
+        ])
+        
+        return pane
+    }
+    
+    private func createPathBar() -> NSView {
+        let bar = NSVisualEffectView()
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.material = .underPageBackground
+        bar.blendingMode = .withinWindow
+        bar.state = .active
+        bar.wantsLayer = true
+        bar.layer?.cornerRadius = 6
+        bar.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMinXMaxYCorner, .layerMaxXMinYCorner, .layerMaxXMaxYCorner]
+        
+        pathControl = NSPathControl()
+        pathControl.translatesAutoresizingMaskIntoConstraints = false
+        pathControl.pathStyle = .standard
+        pathControl.focusRingType = .none
+        pathControl.font = NSFont.systemFont(ofSize: 12)
+        pathControl.isEnabled = true
+        pathControl.isEditable = false
+        bar.addSubview(pathControl)
+        
+        NSLayoutConstraint.activate([
+            pathControl.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 10),
+            pathControl.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -10),
+            pathControl.centerYAnchor.constraint(equalTo: bar.centerYAnchor)
+        ])
+        
+        return bar
+    }
+    
+    
+    // MARK: - Preview Loading
+    func preparePreviewOfFile(at url: URL, completionHandler handler: @escaping (Error?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let start = CFAbsoluteTimeGetCurrent()
+                let contents = try FileManager.default.contentsOfDirectory(
+                    at: url,
+                    includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey],
+                    options: [.skipsHiddenFiles]
+                )
+                let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+                DebugLogger.shared.log("Enumerated \(contents.count) entries for \(url.lastPathComponent) in \(String(format: "%.1f", elapsed)) ms")
+                
+                let sortedContents = self.sortURLs(contents)
+                var rootItems: [FileItem] = []
+                var totalSize: Int64 = 0
+                var folderCount = 0
+                var fileCount = 0
+                
+                for entry in sortedContents.prefix(500) {
+                    let values = try entry.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey])
+                    let item = FileItem(url: entry, resourceValues: values)
+                    if item.isFolder {
+                        folderCount += 1
+                    } else {
+                        fileCount += 1
+                        totalSize += item.size
+                    }
+                    rootItems.append(item)
+                }
+                
+                let icon = NSWorkspace.shared.icon(forFile: url.path)
+                icon.size = NSSize(width: 48, height: 48)
+                let infoText = "\(self.byteFormatter.string(fromByteCount: totalSize)) · \(folderCount) folders, \(fileCount) files"
+                
+                DispatchQueue.main.async {
+                    DebugLogger.shared.log("Applying preview data for \(url.lastPathComponent). Diagnostics log: \(DebugLogger.shared.locationDescription())")
+                    self.rootItems = rootItems
+                    self.previewRootURL = url
+                    self.rebuildVisibleRootItems()
+                    self.iconImageView.image = icon
+                    self.titleLabel.stringValue = url.lastPathComponent
+                    self.infoLabel.stringValue = infoText
+                    self.outlineView.reloadData()
+                    self.syncPreviewWithSelection()
+                    handler(nil)
+                }
+            } catch {
+                DebugLogger.shared.log("Failed to build preview for \(url.lastPathComponent): \(error.localizedDescription)")
+                DispatchQueue.main.async {
+                    handler(error)
+                }
+            }
+        }
+    }
+    
+    // MARK: - Actions
+    @objc private func filterChanged(_ sender: NSSegmentedControl) {
+        guard let type = FilterType(rawValue: sender.selectedSegment) else { return }
+        DebugLogger.shared.log("Filter switched to \(type)")
+        filterType = type
+        rebuildVisibleRootItems()
+        outlineView.reloadData()
+        syncPreviewWithSelection()
+    }
+    
+    // MARK: - Helpers
+    private func sortURLs(_ urls: [URL]) -> [URL] {
+        let sorted = urls.sorted { lhs, rhs in
+            let lhsDir = (try? lhs.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            let rhsDir = (try? rhs.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            if lhsDir != rhsDir {
+                return lhsDir
+            }
+            return lhs.lastPathComponent.localizedStandardCompare(rhs.lastPathComponent) == .orderedAscending
+        }
+        if let descriptor = currentSortDescriptor {
+            return sorted.sorted { lhs, rhs in
+                compareURLs(lhs, rhs, with: descriptor)
+            }
+        }
+        return sorted
+    }
+    
+    private func compareURLs(_ lhs: URL, _ rhs: URL, with descriptor: NSSortDescriptor) -> Bool {
+        let key = descriptor.key ?? "name"
+        let ascending = descriptor.ascending
+        switch key {
+        case "name":
+            return ascending ?
+                lhs.lastPathComponent.localizedStandardCompare(rhs.lastPathComponent) == .orderedAscending :
+                rhs.lastPathComponent.localizedStandardCompare(lhs.lastPathComponent) == .orderedAscending
+        case "date":
+            let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            let rhsDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            return ascending ? lhsDate < rhsDate : lhsDate > rhsDate
+        case "size":
+            let lhsSize = Int64((try? lhs.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+            let rhsSize = Int64((try? rhs.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+            return ascending ? lhsSize < rhsSize : lhsSize > rhsSize
+        case "kind":
+            let lhsType = (try? lhs.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.localizedDescription ?? ""
+            let rhsType = (try? rhs.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.localizedDescription ?? ""
+            return ascending ? lhsType < rhsType : lhsType > rhsType
+        default:
+            return true
+        }
+    }
+    
+    private func rebuildVisibleRootItems() {
+        if filterType == .all {
+            visibleRootItems = rootItems
+            return
+        }
+        visibleRootItems = filterItems(rootItems)
+    }
+    
+    private func children(of item: FileItem?) -> [FileItem] {
+        if let item {
+            guard let children = item.children else { return [] }
+            return filterItems(children)
+        }
+        return visibleRootItems
+    }
+    
+    private func filterItems(_ items: [FileItem]) -> [FileItem] {
+        items.filter { item in
+            filterType.matches(item)
+        }
+    }
+    
+    private func updatePreviewPath(for item: FileItem?) {
+        guard let referenceRoot = previewRootURL ?? item?.url else {
+            pathControl.url = nil
+            return
+        }
+        let target = item?.url ?? referenceRoot
+        pathControl.url = target
+    }
+    
+    private func syncPreviewWithSelection() {
+        updatePreview(for: selectedItems.last)
+    }
+    
+    private func updatePreview(for item: FileItem?) {
+        previewImageLoadTask?.cancel()
+        previewImageLoadTask = nil
+        previewSpinner.stopAnimation(nil)
+        previewImageView.image = nil
+        previewedItem = item
+        
+        guard let item else {
+            previewTitleLabel.stringValue = "No Selection"
+            previewInfoLabel.stringValue = "Select a file or folder to preview."
+            previewMessageLabel.stringValue = ""
+            previewMessageLabel.isHidden = true
+            updatePreviewPath(for: nil)
+            return
+        }
+        
+        previewTitleLabel.stringValue = item.name
+        
+        var infoSegments: [String] = []
+        if !item.isFolder {
+            infoSegments.append(byteFormatter.string(fromByteCount: item.size))
+        }
+        infoSegments.append(item.kindDescription)
+        infoSegments.append(dateFormatter.string(from: item.modificationDate))
+        previewInfoLabel.stringValue = infoSegments.joined(separator: " · ")
+        
+        previewMessageLabel.isHidden = true
+        updatePreviewPath(for: item)
+        
+        if item.contentType?.conforms(to: .image) == true {
+            DebugLogger.shared.log("Preview loading image \(item.name)")
+            loadPreviewImage(for: item)
+        } else {
+            loadLargeIcon(for: item) { [weak self] icon in
+                guard let self, self.previewedItem === item else { return }
+                self.previewImageView.image = icon
+            }
+            previewMessageLabel.stringValue = "Preview available for images only."
+            previewMessageLabel.isHidden = false
+        }
+    }
+    
+    private func loadPreviewImage(for item: FileItem) {
+        previewSpinner.startAnimation(nil)
+        let start = CFAbsoluteTimeGetCurrent()
+        let task = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            autoreleasepool {
+                let image = NSImage(contentsOf: item.url)
+                DispatchQueue.main.async {
+                    guard self.previewedItem === item else { return }
+                    self.previewSpinner.stopAnimation(nil)
+                    let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+                    DebugLogger.shared.log("Preview image load for \(item.name) finished in \(String(format: "%.1f", elapsed)) ms")
+                    if let image {
+                        self.previewImageView.image = image
+                    } else {
+                        self.previewMessageLabel.stringValue = "Could not load image."
+                        self.previewMessageLabel.isHidden = false
+                        self.loadLargeIcon(for: item) { [weak self] icon in
+                            guard let self, self.previewedItem === item else { return }
+                            self.previewImageView.image = icon
+                        }
+                    }
+                    self.previewImageLoadTask = nil
+                }
+            }
+        }
+        previewImageLoadTask = task
+        DispatchQueue.global(qos: .userInitiated).async(execute: task)
+    }
+    
+    private var selectedItems: [FileItem] {
+        outlineView.selectedRowIndexes.compactMap { outlineView.item(atRow: $0) as? FileItem }
+    }
+    
+    private func actionURLs() -> [URL] {
+        let selection = selectedItems.map { $0.url }
+        if !selection.isEmpty { return selection }
+        if let previewedItem {
+            return [previewedItem.url]
+        }
+        return []
+    }
+    
+    @objc private func copyPathAction() {
+        let urls = actionURLs().map { $0.path }
+        guard !urls.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects(urls as [NSString])
+    }
+    
+    private func showQuickLook() {
+        guard QLPreviewPanel.shared()?.isVisible == false else {
+            QLPreviewPanel.shared()?.reloadData()
+            return
+        }
+        guard let panel = QLPreviewPanel.shared(), !selectedItems.isEmpty else { return }
+        panel.dataSource = self
+        panel.delegate = self
+        panel.makeKeyAndOrderFront(self)
+    }
+    
+    private lazy var contextMenu: NSMenu = {
+        let menu = NSMenu(title: "Actions")
+        menu.addItem(withTitle: "Copy Path", action: #selector(copyPathAction), keyEquivalent: "")
+        return menu
+    }()
+    
+    
+    private func loadChildren(for item: FileItem, completion: @escaping () -> Void) {
+        if item.childrenLoaded {
+            completion()
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let start = CFAbsoluteTimeGetCurrent()
+                let contents = try FileManager.default.contentsOfDirectory(
+                    at: item.url,
+                    includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey],
+                    options: [.skipsHiddenFiles]
+                )
+                let sorted = self.sortURLs(contents)
+                var children: [FileItem] = []
+                for entry in sorted.prefix(500) {
+                    let values = try entry.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey])
+                    children.append(FileItem(url: entry, resourceValues: values, parent: item))
+                }
+                let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+                DispatchQueue.main.async {
+                    DebugLogger.shared.log("Loaded \(children.count) children for \(item.name) in \(String(format: "%.1f", elapsed)) ms")
+                    item.setChildren(children)
+                    completion()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    DebugLogger.shared.log("Failed to load children for \(item.name): \(error.localizedDescription)")
+                    item.setChildren([])
+                    completion()
+                }
+            }
+        }
+    }
+    
+    private func loadIcon(for item: FileItem, completion: @escaping (NSImage) -> Void) {
+        if let icon = item.icon {
+            completion(icon)
+            return
+        }
+        DispatchQueue.global(qos: .utility).async {
+            let icon = NSWorkspace.shared.icon(forFile: item.url.path)
+            icon.size = NSSize(width: 16, height: 16)
+            DispatchQueue.main.async {
+                item.icon = icon
+                completion(icon)
+            }
+        }
+    }
+    
+    private func loadLargeIcon(for item: FileItem, completion: @escaping (NSImage) -> Void) {
+        DispatchQueue.global(qos: .utility).async {
+            let icon = NSWorkspace.shared.icon(forFile: item.url.path)
+            icon.size = NSSize(width: 256, height: 256)
+            DispatchQueue.main.async {
+                completion(icon)
+            }
+        }
+    }
+}
+
+// MARK: - NSOutlineViewDataSource
+extension PreviewViewController: NSOutlineViewDataSource {
+    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        return children(of: item as? FileItem).count
+    }
+    
+    func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        return children(of: item as? FileItem)[index]
+    }
+    
+    func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        guard let fileItem = item as? FileItem else { return false }
+        return fileItem.isFolder
+    }
+}
+
+// MARK: - NSOutlineViewDelegate
+extension PreviewViewController: NSOutlineViewDelegate {
+    func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+        guard let fileItem = item as? FileItem,
+              let identifier = tableColumn?.identifier else { return nil }
+        let reuseIdentifier = NSUserInterfaceItemIdentifier("cell-\(identifier.rawValue)")
+        let cellView: NSTableCellView
+        
+        if let existing = outlineView.makeView(withIdentifier: reuseIdentifier, owner: self) as? NSTableCellView {
+            cellView = existing
+        } else {
+            cellView = NSTableCellView()
+            cellView.identifier = reuseIdentifier
+            let stackView = NSStackView()
+            stackView.translatesAutoresizingMaskIntoConstraints = false
+            stackView.orientation = .horizontal
+            stackView.alignment = .centerY
+            stackView.spacing = 6
+            cellView.addSubview(stackView)
+            NSLayoutConstraint.activate([
+                stackView.leadingAnchor.constraint(equalTo: cellView.leadingAnchor, constant: 6),
+                stackView.trailingAnchor.constraint(equalTo: cellView.trailingAnchor, constant: -6),
+                stackView.topAnchor.constraint(equalTo: cellView.topAnchor, constant: 2),
+                stackView.bottomAnchor.constraint(equalTo: cellView.bottomAnchor, constant: -2)
+            ])
+            if identifier.rawValue == "name" {
+                let imageView = NSImageView()
+                imageView.translatesAutoresizingMaskIntoConstraints = false
+                imageView.imageScaling = .scaleProportionallyDown
+                NSLayoutConstraint.activate([
+                    imageView.widthAnchor.constraint(equalToConstant: 16),
+                    imageView.heightAnchor.constraint(equalToConstant: 16)
+                ])
+                stackView.addArrangedSubview(imageView)
+                cellView.imageView = imageView
+            }
+            let alignment: NSTextAlignment = identifier.rawValue == "size" ? .right : .left
+            let textField = NSTextField()
+            textField.isBordered = false
+            textField.backgroundColor = .clear
+            textField.isEditable = false
+            textField.font = NSFont.systemFont(ofSize: 13)
+            textField.textColor = .labelColor
+            textField.lineBreakMode = .byTruncatingTail
+            textField.alignment = alignment
+            textField.translatesAutoresizingMaskIntoConstraints = false
+            stackView.addArrangedSubview(textField)
+            cellView.textField = textField
+        }
+        
+        switch identifier.rawValue {
+        case "name":
+            cellView.textField?.stringValue = fileItem.name
+            loadIcon(for: fileItem) { icon in
+                cellView.imageView?.image = icon
+            }
+        case "date":
+            cellView.textField?.stringValue = dateFormatter.string(from: fileItem.modificationDate)
+        case "size":
+            cellView.textField?.stringValue = fileItem.isFolder ? "—" : byteFormatter.string(fromByteCount: fileItem.size)
+        case "kind":
+            cellView.textField?.stringValue = fileItem.kindDescription
+        default:
+            cellView.textField?.stringValue = ""
+        }
+        return cellView
+    }
+    
+    func outlineView(_ outlineView: NSOutlineView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+        currentSortDescriptor = outlineView.sortDescriptors.first
+        rebuildVisibleRootItems()
+        outlineView.reloadData()
+    }
+    
+    func outlineView(_ outlineView: NSOutlineView, shouldExpandItem item: Any) -> Bool {
+        guard let fileItem = item as? FileItem else { return false }
+        loadChildren(for: fileItem) {
+            outlineView.reloadItem(fileItem, reloadChildren: true)
+        }
+        return true
+    }
+    
+    func outlineViewSelectionDidChange(_ notification: Notification) {
+        guard notification.object as? NSOutlineView === outlineView else { return }
+        DebugLogger.shared.log("Selection changed → \(selectedItems.last?.name ?? "none")")
+        syncPreviewWithSelection()
+    }
+}
+
+// MARK: - Keyboard & Menu Handling
+extension PreviewViewController {
+}
+
+extension PreviewViewController: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        let location = outlineView.convert(outlineView.window?.mouseLocationOutsideOfEventStream ?? .zero, from: nil)
+        let row = outlineView.row(at: location)
+        if row >= 0 && !outlineView.isRowSelected(row) {
+            outlineView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        let hasSelection = !selectedItems.isEmpty
+        menu.items.forEach { $0.isEnabled = hasSelection }
+    }
+}
+
+// MARK: - Quick Look Panel
+extension PreviewViewController: QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+        selectedItems.count
+    }
+    
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
+        selectedItems[index]
+    }
+}
+
+// MARK: - Outline Keyboard Delegate
+extension PreviewViewController: FinderOutlineViewKeyboardDelegate {
+    func outlineView(_ outlineView: FinderOutlineView, handle event: NSEvent) -> Bool {
+        let commandPressed = event.modifierFlags.contains(.command)
+        switch (event.keyCode, commandPressed) {
+        case (49, false): // Space
+            showQuickLook()
+            return true
+        case (_, true) where event.charactersIgnoringModifiers == "c":
+            copyPathAction()
+            return true
+        default:
+            return false
+        }
     }
 }
