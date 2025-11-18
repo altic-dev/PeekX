@@ -15,6 +15,12 @@ A native macOS Quick Look extension that provides instant previews of folder con
 
 PeekX enhances the macOS Quick Look feature by allowing you to preview the contents of any folder without opening it. Simply select a folder in Finder and press Space to see a comprehensive breakdown of its contents, including file types, sizes, and structure.
 
+### 📺 Demo Video
+
+[![Watch PeekX in Action](https://img.youtube.com/vi/GD9e9tEScns/maxresdefault.jpg)](https://youtu.be/GD9e9tEScns)
+
+**[▶️ Watch the demo on YouTube](https://youtu.be/GD9e9tEScns)**
+
 ## Features
 
 - **Instant Folder Preview** - View folder contents directly in Quick Look
