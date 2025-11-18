@@ -49,3 +49,10 @@ iOSInjectionProject/
 # Test files
 test_analysis.swift
 
+*.sh
+
+RELEASE_NOTES_*.md
+BUILD_GUIDE.md
+SETUP_INSTRUCTIONS.txt
+releases/
+**.txt 

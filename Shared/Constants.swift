@@ -2,7 +2,7 @@
 //  Constants.swift
 //  PeekX
 //
-//  Shared constants for PeekX app and extension
+//  Copyright © 2025 ALTIC. All rights reserved.
 //
 
 import Foundation
@@ -17,9 +17,8 @@ struct PreviewConstants {
     static let maxRecursionDepth = 10
     static let largeFolderThreshold = 1000 // files
     
-    // Performance Constraints (Quick Look extensions have strict limits)
     static let analysisTimeoutSeconds: TimeInterval = 5.0
-    static let maxMemoryUsageMB: UInt64 = 50 // Stay well under 100MB limit
+    static let maxMemoryUsageMB: UInt64 = 50
     
     // Cache Settings
     static let maxCacheItems = 50

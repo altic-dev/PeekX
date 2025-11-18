@@ -2,7 +2,7 @@
 //  SharedSettings.swift
 //  PeekX
 //
-//  Shared settings between main app and Quick Look extension
+//  Copyright © 2025 ALTIC. All rights reserved.
 //
 
 import Foundation
@@ -24,23 +24,18 @@ struct SharedSettings: Codable, Equatable {
         maxLargestFiles: 10
     )
     
-    // App Group identifier - IMPORTANT: Update this in your Xcode project capabilities
     static let appGroupIdentifier = "group.altic.PeekX"
     
     static func load() -> SharedSettings {
-        // Try to load from App Group, but fail gracefully
         guard let userDefaults = UserDefaults(suiteName: appGroupIdentifier) else {
-            print("⚠️ PeekX: App Group not available, using defaults")
             return .default
         }
         
         guard let data = userDefaults.data(forKey: "settings"),
               let settings = try? JSONDecoder().decode(SharedSettings.self, from: data) else {
-            print("⚠️ PeekX: No saved settings found, using defaults")
             return .default
         }
         
-        print("✅ PeekX: Loaded settings from App Group")
         return settings
     }
     

@@ -1,10 +1,11 @@
 // PeekX - Folder Preview Extension for macOS
-// Copyright © 2025. All rights reserved.
+// Copyright © 2025 ALTIC. All rights reserved.
 
 import Cocoa
 import Quartz
 import UniformTypeIdentifiers
 import QuickLook
+import ImageIO
 
 // MARK: - Debug Logger
 final class DebugLogger {
@@ -258,11 +259,12 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         splitView.arrangedSubviews[0].widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
         splitView.arrangedSubviews[1].widthAnchor.constraint(greaterThanOrEqualToConstant: 340).isActive = true
         
-        pathBarView = createPathBar()
+        // Path bar (commented out - not displayed)
+        // pathBarView = createPathBar()
         
         container.addSubview(headerView)
         container.addSubview(controlsStack)
-        container.addSubview(pathBarView)
+        // container.addSubview(pathBarView)
         container.addSubview(splitView)
         
         NSLayoutConstraint.activate([
@@ -274,12 +276,14 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             controlsStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
             controlsStack.topAnchor.constraint(equalTo: headerView.bottomAnchor, constant: 12),
             
-            pathBarView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-            pathBarView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-            pathBarView.topAnchor.constraint(equalTo: controlsStack.bottomAnchor, constant: 8),
-            pathBarView.heightAnchor.constraint(equalToConstant: 26),
+            // Path bar constraints (commented out)
+            // pathBarView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            // pathBarView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            // pathBarView.topAnchor.constraint(equalTo: controlsStack.bottomAnchor, constant: 8),
+            // pathBarView.heightAnchor.constraint(equalToConstant: 26),
+            // splitView.topAnchor.constraint(equalTo: pathBarView.bottomAnchor, constant: 8),
             
-            splitView.topAnchor.constraint(equalTo: pathBarView.bottomAnchor, constant: 8),
+            splitView.topAnchor.constraint(equalTo: controlsStack.bottomAnchor, constant: 8),
             splitView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
             splitView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
             splitView.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16)
@@ -542,12 +546,13 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                     }
                     rootItems.append(item)
                 }
+                self.sortFileItems(&rootItems)
                 
-                let icon = NSWorkspace.shared.icon(forFile: url.path)
-                icon.size = NSSize(width: 48, height: 48)
                 let infoText = "\(self.byteFormatter.string(fromByteCount: totalSize)) · \(folderCount) folders, \(fileCount) files"
                 
                 DispatchQueue.main.async {
+                    let icon = NSWorkspace.shared.icon(forFile: url.path)
+                    icon.size = NSSize(width: 48, height: 48)
                     DebugLogger.shared.log("Applying preview data for \(url.lastPathComponent). Diagnostics log: \(DebugLogger.shared.locationDescription())")
                     self.rootItems = rootItems
                     self.previewRootURL = url
@@ -594,6 +599,78 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             }
         }
         return sorted
+    }
+    
+    private func sortFileItems(_ items: inout [FileItem]) {
+        guard !items.isEmpty else { return }
+        let comparator = makeItemComparator()
+        items.sort(by: comparator)
+    }
+    
+    private func makeItemComparator() -> (FileItem, FileItem) -> Bool {
+        if let descriptor = currentSortDescriptor {
+            return { lhs, rhs in
+                self.compareFileItems(lhs, rhs, with: descriptor)
+            }
+        }
+        return { lhs, rhs in
+            self.defaultItemComparator(lhs, rhs)
+        }
+    }
+    
+    private func compareFileItems(_ lhs: FileItem, _ rhs: FileItem, with descriptor: NSSortDescriptor) -> Bool {
+        let ascending = descriptor.ascending
+        switch descriptor.key ?? "name" {
+        case "date":
+            if lhs.modificationDate == rhs.modificationDate {
+                return defaultItemComparator(lhs, rhs)
+            }
+            return ascending ? lhs.modificationDate < rhs.modificationDate : lhs.modificationDate > rhs.modificationDate
+        case "size":
+            if lhs.size == rhs.size {
+                return defaultItemComparator(lhs, rhs)
+            }
+            return ascending ? lhs.size < rhs.size : lhs.size > rhs.size
+        case "kind":
+            if lhs.kindDescription == rhs.kindDescription {
+                return defaultItemComparator(lhs, rhs)
+            }
+            return ascending ? lhs.kindDescription < rhs.kindDescription : lhs.kindDescription > rhs.kindDescription
+        case "name":
+            fallthrough
+        default:
+            if lhs.name == rhs.name {
+                return defaultItemComparator(lhs, rhs)
+            }
+            if ascending {
+                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            } else {
+                return rhs.name.localizedStandardCompare(lhs.name) == .orderedAscending
+            }
+        }
+    }
+    
+    private func defaultItemComparator(_ lhs: FileItem, _ rhs: FileItem) -> Bool {
+        if lhs.isFolder != rhs.isFolder {
+            return lhs.isFolder && !rhs.isFolder
+        }
+        return lhs.name.localizedStandardCompare(rhs.name) != .orderedDescending
+    }
+    
+    private func resortDescendants(from items: [FileItem]) {
+        guard !items.isEmpty else { return }
+        let comparator = makeItemComparator()
+        resortDescendants(items, comparator: comparator)
+    }
+    
+    private func resortDescendants(_ items: [FileItem], comparator: @escaping (FileItem, FileItem) -> Bool) {
+        for item in items {
+            if var children = item.children {
+                children.sort(by: comparator)
+                item.children = children
+                resortDescendants(children, comparator: comparator)
+            }
+        }
     }
     
     private func compareURLs(_ lhs: URL, _ rhs: URL, with descriptor: NSSortDescriptor) -> Bool {
@@ -643,14 +720,15 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         }
     }
     
-    private func updatePreviewPath(for item: FileItem?) {
-        guard let referenceRoot = previewRootURL ?? item?.url else {
-            pathControl.url = nil
-            return
-        }
-        let target = item?.url ?? referenceRoot
-        pathControl.url = target
-    }
+    // Path bar update (commented out - path bar not displayed)
+    // private func updatePreviewPath(for item: FileItem?) {
+    //     guard let referenceRoot = previewRootURL ?? item?.url else {
+    //         pathControl.url = nil
+    //         return
+    //     }
+    //     let target = item?.url ?? referenceRoot
+    //     pathControl.url = target
+    // }
     
     private func syncPreviewWithSelection() {
         updatePreview(for: selectedItems.last)
@@ -668,7 +746,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             previewInfoLabel.stringValue = "Select a file or folder to preview."
             previewMessageLabel.stringValue = ""
             previewMessageLabel.isHidden = true
-            updatePreviewPath(for: nil)
+            // updatePreviewPath(for: nil)
             return
         }
         
@@ -683,7 +761,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         previewInfoLabel.stringValue = infoSegments.joined(separator: " · ")
         
         previewMessageLabel.isHidden = true
-        updatePreviewPath(for: item)
+        // updatePreviewPath(for: item)
         
         if item.contentType?.conforms(to: .image) == true {
             DebugLogger.shared.log("Preview loading image \(item.name)")
@@ -701,27 +779,28 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     private func loadPreviewImage(for item: FileItem) {
         previewSpinner.startAnimation(nil)
         let start = CFAbsoluteTimeGetCurrent()
+        let fileURL = item.url as NSURL
         let task = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            autoreleasepool {
-                let image = NSImage(contentsOf: item.url)
-                DispatchQueue.main.async {
-                    guard self.previewedItem === item else { return }
-                    self.previewSpinner.stopAnimation(nil)
-                    let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
-                    DebugLogger.shared.log("Preview image load for \(item.name) finished in \(String(format: "%.1f", elapsed)) ms")
-                    if let image {
-                        self.previewImageView.image = image
-                    } else {
-                        self.previewMessageLabel.stringValue = "Could not load image."
-                        self.previewMessageLabel.isHidden = false
-                        self.loadLargeIcon(for: item) { [weak self] icon in
-                            guard let self, self.previewedItem === item else { return }
-                            self.previewImageView.image = icon
-                        }
+            let source = CGImageSourceCreateWithURL(fileURL, nil)
+            let cgImage = source.flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) }
+            DispatchQueue.main.async {
+                guard self.previewedItem === item else { return }
+                self.previewSpinner.stopAnimation(nil)
+                let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+                DebugLogger.shared.log("Preview image load for \(item.name) finished in \(String(format: "%.1f", elapsed)) ms")
+                if let cgImage {
+                    let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                    self.previewImageView.image = image
+                } else {
+                    self.previewMessageLabel.stringValue = "Could not load image."
+                    self.previewMessageLabel.isHidden = false
+                    self.loadLargeIcon(for: item) { [weak self] icon in
+                        guard let self, self.previewedItem === item else { return }
+                        self.previewImageView.image = icon
                     }
-                    self.previewImageLoadTask = nil
                 }
+                self.previewImageLoadTask = nil
             }
         }
         previewImageLoadTask = task
@@ -785,6 +864,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                     let values = try entry.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentTypeKey, .contentModificationDateKey])
                     children.append(FileItem(url: entry, resourceValues: values, parent: item))
                 }
+                self.sortFileItems(&children)
                 let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
                 DispatchQueue.main.async {
                     DebugLogger.shared.log("Loaded \(children.count) children for \(item.name) in \(String(format: "%.1f", elapsed)) ms")
@@ -806,23 +886,21 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             completion(icon)
             return
         }
-        DispatchQueue.global(qos: .utility).async {
-            let icon = NSWorkspace.shared.icon(forFile: item.url.path)
+        let path = item.url.path
+        DispatchQueue.main.async {
+            let icon = NSWorkspace.shared.icon(forFile: path)
             icon.size = NSSize(width: 16, height: 16)
-            DispatchQueue.main.async {
-                item.icon = icon
-                completion(icon)
-            }
+            item.icon = icon
+            completion(icon)
         }
     }
     
     private func loadLargeIcon(for item: FileItem, completion: @escaping (NSImage) -> Void) {
-        DispatchQueue.global(qos: .utility).async {
-            let icon = NSWorkspace.shared.icon(forFile: item.url.path)
+        let path = item.url.path
+        DispatchQueue.main.async {
+            let icon = NSWorkspace.shared.icon(forFile: path)
             icon.size = NSSize(width: 256, height: 256)
-            DispatchQueue.main.async {
-                completion(icon)
-            }
+            completion(icon)
         }
     }
 }
@@ -913,6 +991,8 @@ extension PreviewViewController: NSOutlineViewDelegate {
     
     func outlineView(_ outlineView: NSOutlineView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
         currentSortDescriptor = outlineView.sortDescriptors.first
+        sortFileItems(&rootItems)
+        resortDescendants(from: rootItems)
         rebuildVisibleRootItems()
         outlineView.reloadData()
     }
