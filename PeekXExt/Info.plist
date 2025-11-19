@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>1.1</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionAttributes</key>
@@ -25,6 +25,8 @@
 			<key>QLSupportedContentTypes</key>
 			<array>
 				<string>public.folder</string>
+				<string>net.daringfireball.markdown</string>
+				<string>public.plain-text</string>
 			</array>
 			<key>QLSupportsSearchableItems</key>
 			<false/>

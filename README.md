@@ -2,6 +2,11 @@
 
 A native macOS Quick Look extension that provides instant previews of folder contents, including file counts, size statistics, and detailed folder analysis.
 
+## 🎉 What's New in v1.1
+
+- **Markdown preview support** - View `.md` files directly in Quick Look
+- **Faster performance** - Improved folder preview speed
+
 ---
 
 > **⭐ Support This Project**  

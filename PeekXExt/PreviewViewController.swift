@@ -6,6 +6,8 @@ import Quartz
 import UniformTypeIdentifiers
 import QuickLook
 import ImageIO
+import WebKit
+import QuartzCore  // For CATransaction
 
 // MARK: - Debug Logger
 final class DebugLogger {
@@ -105,6 +107,17 @@ final class FileItem: NSObject, QLPreviewItem {
     var children: [FileItem]?
     var childrenLoaded = false
     
+    // Cached formatted strings to avoid repeated formatting
+    private var _formattedSize: String?
+    private var _formattedDate: String?
+    private var _kindDescription: String?
+    private var _previewInfo: String?
+    
+    // Cached type checks for fast preview decisions
+    lazy var isImage: Bool = contentType?.conforms(to: .image) ?? false
+    lazy var isText: Bool = contentType?.conforms(to: .text) ?? false || url.pathExtension.lowercased() == "md"
+    lazy var isMedia: Bool = contentType?.conforms(to: .audiovisualContent) ?? false
+    
     init(url: URL, resourceValues: URLResourceValues, parent: FileItem? = nil) {
         self.url = url
         self.name = url.lastPathComponent
@@ -117,7 +130,48 @@ final class FileItem: NSObject, QLPreviewItem {
     }
     
     var kindDescription: String {
-        isFolder ? "Folder" : (contentType?.localizedDescription ?? "File")
+        if let cached = _kindDescription {
+            return cached
+        }
+        let desc = isFolder ? "Folder" : (contentType?.localizedDescription ?? "File")
+        _kindDescription = desc
+        return desc
+    }
+    
+    // Lazy formatted size - computed once and cached
+    func formattedSize(using formatter: ByteCountFormatter) -> String {
+        if let cached = _formattedSize {
+            return cached
+        }
+        let formatted = isFolder ? "—" : formatter.string(fromByteCount: size)
+        _formattedSize = formatted
+        return formatted
+    }
+    
+    // Lazy formatted date - computed once and cached
+    func formattedDate(using formatter: DateFormatter) -> String {
+        if let cached = _formattedDate {
+            return cached
+        }
+        let formatted = formatter.string(from: modificationDate)
+        _formattedDate = formatted
+        return formatted
+    }
+    
+    // Pre-build complete preview info string
+    func previewInfo(sizeFormatter: ByteCountFormatter, dateFormatter: DateFormatter) -> String {
+        if let cached = _previewInfo {
+            return cached
+        }
+        var segments: [String] = []
+        if !isFolder {
+            segments.append(formattedSize(using: sizeFormatter))
+        }
+        segments.append(kindDescription)
+        segments.append(formattedDate(using: dateFormatter))
+        let info = segments.joined(separator: " · ")
+        _previewInfo = info
+        return info
     }
     
     func setChildren(_ children: [FileItem]) {
@@ -155,21 +209,20 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             case .folders:
                 return item.isFolder
             case .images:
-                return item.contentType?.conforms(to: .image) ?? false
+                return item.isImage
             case .documents:
                 if item.isFolder { return false }
-                if let type = item.contentType {
-                    if type.conforms(to: .image) || type.conforms(to: .audiovisualContent) { return false }
-                }
-                return true
+                // Document = not image and not media
+                return !item.isImage && !item.isMedia
             case .media:
-                return item.contentType?.conforms(to: .audiovisualContent) ?? false
+                return item.isMedia
             }
         }
     }
     
     // MARK: - UI Components
     
+    private var mainStack: NSStackView!
     private var scrollView: NSScrollView!
     private var splitView: NSSplitView!
     private var outlineView: FinderOutlineView!
@@ -177,15 +230,23 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     private var iconImageView: NSImageView!
     private var titleLabel: NSTextField!
     private var infoLabel: NSTextField!
+    private var controlsStack: NSStackView!
     private var filterControl: NSSegmentedControl!
     private var previewPane: NSView!
     private var pathBarView: NSView!
     private var pathControl: NSPathControl!
     private var previewImageView: NSImageView!
+    private var webView: WKWebView!
+    private var singleFileWebView: WKWebView!  // Separate WebView for single file mode
     private var previewSpinner: NSProgressIndicator!
     private var previewTitleLabel: NSTextField!
     private var previewInfoLabel: NSTextField!
     private var previewMessageLabel: NSTextField!
+    
+    // MARK: - Performance Caches
+    
+    private let iconCache = NSCache<NSString, NSImage>()
+    private let iconLoadQueue = DispatchQueue(label: "com.peekx.iconloader", qos: .userInitiated, attributes: .concurrent)
     
     // MARK: - Data State
     
@@ -197,6 +258,8 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     private var previewImageLoadTask: DispatchWorkItem?
     private var previewRootURL: URL?
     private var didSetInitialSplitPosition = false
+    private var singleFileMode = false
+    private var previewUpdateWorkItem: DispatchWorkItem?
     
     // MARK: - Formatters
     
@@ -221,8 +284,18 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
         container.translatesAutoresizingMaskIntoConstraints = false
         
+        // Main Vertical Stack
+        let stack = NSStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.spacing = 12
+        stack.alignment = .centerX
+        stack.distribution = .fill
+        self.mainStack = stack
+        
         headerView = createHeaderView()
-        let controlsStack = createControlsStack()
+        controlsStack = createControlsStack()
+        
         scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
@@ -259,34 +332,41 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         splitView.arrangedSubviews[0].widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
         splitView.arrangedSubviews[1].widthAnchor.constraint(greaterThanOrEqualToConstant: 340).isActive = true
         
-        // Path bar (commented out - not displayed)
-        // pathBarView = createPathBar()
-        
-        container.addSubview(headerView)
-        container.addSubview(controlsStack)
-        // container.addSubview(pathBarView)
-        container.addSubview(splitView)
+        mainStack.addArrangedSubview(headerView)
+        mainStack.addArrangedSubview(controlsStack)
+        mainStack.addArrangedSubview(splitView)
+
+        container.addSubview(mainStack)
         
         NSLayoutConstraint.activate([
-            headerView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-            headerView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-            headerView.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
+            mainStack.topAnchor.constraint(equalTo: container.topAnchor, constant: 16),
+            mainStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            mainStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            mainStack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16),
             
-            controlsStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-            controlsStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-            controlsStack.topAnchor.constraint(equalTo: headerView.bottomAnchor, constant: 12),
-            
-            // Path bar constraints (commented out)
-            // pathBarView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-            // pathBarView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-            // pathBarView.topAnchor.constraint(equalTo: controlsStack.bottomAnchor, constant: 8),
-            // pathBarView.heightAnchor.constraint(equalToConstant: 26),
-            // splitView.topAnchor.constraint(equalTo: pathBarView.bottomAnchor, constant: 8),
-            
-            splitView.topAnchor.constraint(equalTo: controlsStack.bottomAnchor, constant: 8),
-            splitView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-            splitView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-            splitView.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16)
+            headerView.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            controlsStack.widthAnchor.constraint(equalTo: mainStack.widthAnchor),
+            splitView.widthAnchor.constraint(equalTo: mainStack.widthAnchor)
+        ])
+        
+        // Content priorities to ensure SplitView fills space
+        headerView.setContentHuggingPriority(.required, for: .vertical)
+        controlsStack.setContentHuggingPriority(.required, for: .vertical)
+        splitView.setContentHuggingPriority(.defaultLow, for: .vertical)
+        
+        // Create standalone WebView for single-file mode
+        let singleFileConfig = WKWebViewConfiguration()
+        singleFileWebView = WKWebView(frame: .zero, configuration: singleFileConfig)
+        singleFileWebView.translatesAutoresizingMaskIntoConstraints = false
+        singleFileWebView.isHidden = true
+        singleFileWebView.setValue(false, forKey: "drawsBackground")
+        container.addSubview(singleFileWebView)
+        
+        NSLayoutConstraint.activate([
+            singleFileWebView.topAnchor.constraint(equalTo: headerView.bottomAnchor, constant: 16),
+            singleFileWebView.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            singleFileWebView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            singleFileWebView.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16)
         ])
         
         createColumns()
@@ -358,6 +438,9 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         stack.orientation = .horizontal
         stack.alignment = .centerY
         stack.spacing = 8
+        
+        // Ensure the stack itself doesn't force a specific width if not needed, 
+        // but we can center the filter control inside it.
         
         NSLayoutConstraint.activate([
             filterControl.widthAnchor.constraint(equalToConstant: 320)
@@ -431,6 +514,12 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         previewImageView.imageScaling = .scaleProportionallyUpOrDown
         previewImageView.imageAlignment = .alignCenter
         
+        let webConfig = WKWebViewConfiguration()
+        webView = WKWebView(frame: .zero, configuration: webConfig)
+        webView.translatesAutoresizingMaskIntoConstraints = false
+        webView.isHidden = true
+        webView.setValue(false, forKey: "drawsBackground")
+        
         previewSpinner = NSProgressIndicator()
         previewSpinner.translatesAutoresizingMaskIntoConstraints = false
         previewSpinner.style = .spinning
@@ -438,6 +527,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         previewSpinner.isDisplayedWhenStopped = false
         
         imageContainer.addSubview(previewImageView)
+        imageContainer.addSubview(webView)
         imageContainer.addSubview(previewSpinner)
         
         let flexibleWidth = imageContainer.widthAnchor.constraint(equalToConstant: 0)
@@ -447,6 +537,11 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             previewImageView.trailingAnchor.constraint(equalTo: imageContainer.trailingAnchor),
             previewImageView.topAnchor.constraint(equalTo: imageContainer.topAnchor),
             previewImageView.bottomAnchor.constraint(equalTo: imageContainer.bottomAnchor),
+            
+            webView.leadingAnchor.constraint(equalTo: imageContainer.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: imageContainer.trailingAnchor),
+            webView.topAnchor.constraint(equalTo: imageContainer.topAnchor),
+            webView.bottomAnchor.constraint(equalTo: imageContainer.bottomAnchor),
             
             previewSpinner.centerXAnchor.constraint(equalTo: imageContainer.centerXAnchor),
             previewSpinner.centerYAnchor.constraint(equalTo: imageContainer.centerYAnchor),
@@ -520,6 +615,113 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     func preparePreviewOfFile(at url: URL, completionHandler handler: @escaping (Error?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
+                // Check if directory
+                let values = try url.resourceValues(forKeys: [.isDirectoryKey])
+                if values.isDirectory == false {
+                    // Single file mode - HELLO WORLD TEST
+                    DebugLogger.shared.log("✅ DETECTED SINGLE FILE: \(url.lastPathComponent)")
+                    NSLog("✅ PeekX: DETECTED SINGLE FILE: \(url.lastPathComponent)")
+                    
+                    DispatchQueue.main.async {
+                        // SINGLE FILE MODE
+                        self.applySingleFileLayout(true)
+                        
+                        // Load markdown content asynchronously
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            let content = (try? String(contentsOf: url, encoding: .utf8)) ?? "Could not read file."
+                            // Escape the content for safe embedding in JS
+                            let escapedContent = content
+                                .replacingOccurrences(of: "\\", with: "\\\\")
+                                .replacingOccurrences(of: "`", with: "\\`")
+                                .replacingOccurrences(of: "$", with: "\\$")
+                            
+                            let html = """
+                            <!DOCTYPE html>
+                            <html>
+                            <head>
+                                <meta charset="utf-8">
+                                <meta name="viewport" content="width=device-width, initial-scale=1">
+                                <script src="https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js"></script>
+                                <style>
+                                    :root { color-scheme: light dark; }
+                                    body {
+                                        margin: 0;
+                                        padding: 20px 60px 40px 60px;
+                                        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+                                        font-size: 15px;
+                                        line-height: 1.6;
+                                        color: #1d1d1f;
+                                        background: #ffffff;
+                                    }
+                                    @media (prefers-color-scheme: dark) {
+                                        body { color: #e5e5e5; background: #1e1e1e; }
+                                        a { color: #58a6ff; }
+                                        code { background: rgba(110,118,129,0.2); color: #e5e5e5; }
+                                        pre { background: rgba(110,118,129,0.15); border-color: rgba(110,118,129,0.3); }
+                                        h1, h2 { border-bottom-color: rgba(110,118,129,0.3); }
+                                        th { background: rgba(110,118,129,0.15); }
+                                        td, th { border-color: rgba(110,118,129,0.3); }
+                                        blockquote { border-left-color: rgba(110,118,129,0.4); color: #a0a0a0; }
+                                    }
+                                    h1, h2, h3, h4, h5, h6 { margin-top: 24px; margin-bottom: 16px; font-weight: 600; line-height: 1.25; }
+                                    h1 { font-size: 2em; border-bottom: 1px solid #e1e4e8; padding-bottom: 8px; }
+                                    h2 { font-size: 1.5em; border-bottom: 1px solid #e1e4e8; padding-bottom: 6px; }
+                                    h3 { font-size: 1.25em; }
+                                    p { margin: 0 0 16px 0; }
+                                    a { color: #0969da; text-decoration: none; }
+                                    a:hover { text-decoration: underline; }
+                                    code {
+                                        font-family: "SF Mono", Monaco, Menlo, Consolas, monospace;
+                                        font-size: 13px;
+                                        background: rgba(175,184,193,0.2);
+                                        padding: 2px 6px;
+                                        border-radius: 4px;
+                                    }
+                                    pre {
+                                        background: #f6f8fa;
+                                        padding: 16px;
+                                        border-radius: 8px;
+                                        overflow-x: auto;
+                                        border: 1px solid #e1e4e8;
+                                        margin: 16px 0;
+                                    }
+                                    pre code { background: none; padding: 0; }
+                                    ul, ol { margin: 0 0 16px 0; padding-left: 32px; }
+                                    li { margin: 4px 0; }
+                                    blockquote {
+                                        margin: 0 0 16px 0;
+                                        padding: 0 16px;
+                                        border-left: 4px solid #d0d7de;
+                                        color: #57606a;
+                                    }
+                                    table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+                                    th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; }
+                                    th { background: #f6f8fa; font-weight: 600; }
+                                    img { max-width: 100%; height: auto; border-radius: 8px; margin: 16px 0; }
+                                </style>
+                            </head>
+                            <body>
+                                <div id="content"></div>
+                                <script>
+                                    const markdown = `\(escapedContent)`;
+                                    document.getElementById('content').innerHTML = marked.parse(markdown);
+                                </script>
+                            </body>
+                            </html>
+                            """
+                            
+                            DispatchQueue.main.async {
+                                self.singleFileWebView.loadHTMLString(html, baseURL: url.deletingLastPathComponent())
+                                DebugLogger.shared.log("✅ Markdown rendered for \(url.lastPathComponent)")
+                                NSLog("✅ PeekX: Markdown rendered for \(url.lastPathComponent)")
+                            }
+                        }
+                        
+                        handler(nil)
+                    }
+                    return
+                }
+
                 let start = CFAbsoluteTimeGetCurrent()
                 let contents = try FileManager.default.contentsOfDirectory(
                     at: url,
@@ -551,6 +753,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
                 let infoText = "\(self.byteFormatter.string(fromByteCount: totalSize)) · \(folderCount) folders, \(fileCount) files"
                 
                 DispatchQueue.main.async {
+                    self.applySingleFileLayout(false)
                     let icon = NSWorkspace.shared.icon(forFile: url.path)
                     icon.size = NSSize(width: 48, height: 48)
                     DebugLogger.shared.log("Applying preview data for \(url.lastPathComponent). Diagnostics log: \(DebugLogger.shared.locationDescription())")
@@ -576,10 +779,18 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     // MARK: - Actions
     @objc private func filterChanged(_ sender: NSSegmentedControl) {
         guard let type = FilterType(rawValue: sender.selectedSegment) else { return }
+        
+        // Early return if filter hasn't changed - avoid unnecessary work
+        guard type != filterType else { return }
+        
         DebugLogger.shared.log("Filter switched to \(type)")
         filterType = type
         rebuildVisibleRootItems()
-        outlineView.reloadData()
+        
+        // Use targeted reload instead of full reloadData() - significantly faster
+        // This reloads only the root level items rather than the entire table structure
+        outlineView.reloadItem(nil, reloadChildren: true)
+        
         syncPreviewWithSelection()
     }
     
@@ -731,13 +942,28 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     // }
     
     private func syncPreviewWithSelection() {
-        updatePreview(for: selectedItems.last)
+        // Cancel any pending preview update
+        previewUpdateWorkItem?.cancel()
+        
+        // Minimal debounce (10ms) - just enough to prevent rapid-fire updates
+        // but imperceptible to users for single clicks
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.updatePreview(for: self.selectedItems.last)
+        }
+        previewUpdateWorkItem = workItem
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01, execute: workItem)
     }
     
     private func updatePreview(for item: FileItem?) {
         previewImageLoadTask?.cancel()
         previewImageLoadTask = nil
         previewSpinner.stopAnimation(nil)
+        
+        // Batch all view updates in a single transaction for better performance
+        CATransaction.begin()
+        
         previewImageView.image = nil
         previewedItem = item
         
@@ -746,34 +972,138 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
             previewInfoLabel.stringValue = "Select a file or folder to preview."
             previewMessageLabel.stringValue = ""
             previewMessageLabel.isHidden = true
+            CATransaction.commit()
             // updatePreviewPath(for: nil)
             return
         }
         
+        // Use pre-built cached info string - zero string operations on UI thread
         previewTitleLabel.stringValue = item.name
-        
-        var infoSegments: [String] = []
-        if !item.isFolder {
-            infoSegments.append(byteFormatter.string(fromByteCount: item.size))
-        }
-        infoSegments.append(item.kindDescription)
-        infoSegments.append(dateFormatter.string(from: item.modificationDate))
-        previewInfoLabel.stringValue = infoSegments.joined(separator: " · ")
-        
+        previewInfoLabel.stringValue = item.previewInfo(sizeFormatter: byteFormatter, dateFormatter: dateFormatter)
         previewMessageLabel.isHidden = true
+        
+        CATransaction.commit()
         // updatePreviewPath(for: item)
         
-        if item.contentType?.conforms(to: .image) == true {
-            DebugLogger.shared.log("Preview loading image \(item.name)")
+        // Use cached type checks instead of repeated UTType conformance checks
+        if item.isImage {
+            webView.isHidden = true
+            previewImageView.isHidden = false
             loadPreviewImage(for: item)
+        } else if item.isText {
+            previewImageView.isHidden = true
+            webView.isHidden = false
+            previewMessageLabel.isHidden = true
+            loadMarkdownPreview(for: item)
         } else {
+            webView.isHidden = true
+            previewImageView.isHidden = false
             loadLargeIcon(for: item) { [weak self] icon in
                 guard let self, self.previewedItem === item else { return }
                 self.previewImageView.image = icon
             }
-            previewMessageLabel.stringValue = "Preview available for images only."
+            previewMessageLabel.stringValue = "Preview available for images and markdown only."
             previewMessageLabel.isHidden = false
         }
+    }
+
+    private func applySingleFileLayout(_ enabled: Bool) {
+        singleFileMode = enabled
+        mainStack.isHidden = enabled
+        singleFileWebView.isHidden = !enabled
+    }
+    
+    private func loadMarkdownPreview(for item: FileItem) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let text = (try? String(contentsOf: item.url, encoding: .utf8)) ?? ""
+            let htmlBody = self.makeHTML(fromMarkdown: text)
+            let template = """
+            <html>
+            <head>
+            <meta charset="utf-8">
+            <style>
+                :root { color-scheme: light dark; }
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+                    margin: 0;
+                    padding: 24px 28px;
+                    line-height: 1.5;
+                    background: transparent;
+                    color: #1f1f1f;
+                }
+                @media (prefers-color-scheme: dark) {
+                    body { color: #e5e5e5; }
+                }
+                h1, h2, h3, h4, h5, h6 { font-weight: 600; }
+                pre, code {
+                    font-family: Menlo, SFMono-Regular, Consolas, monospace;
+                }
+                pre {
+                    background-color: rgba(142,142,147,0.08);
+                    padding: 12px 16px;
+                    border-radius: 8px;
+                    overflow-x: auto;
+                }
+                table {
+                    border-collapse: collapse;
+                    width: 100%;
+                    margin: 16px 0;
+                }
+                th, td {
+                    border: 1px solid rgba(142,142,147,0.3);
+                    padding: 6px 8px;
+                    text-align: left;
+                }
+                blockquote {
+                    border-left: 3px solid rgba(142,142,147,0.4);
+                    margin: 0;
+                    padding-left: 12px;
+                    color: rgba(60,60,67,0.7);
+                }
+            </style>
+            </head>
+            <body>
+            \(htmlBody)
+            </body>
+            </html>
+            """
+            DispatchQueue.main.async {
+                guard self.previewedItem === item else { return }
+                self.webView.loadHTMLString(template, baseURL: item.url.deletingLastPathComponent())
+            }
+        }
+    }
+    
+    private func makeHTML(fromMarkdown markdown: String) -> String {
+        if markdown.isEmpty {
+            return "<p>No content.</p>"
+        }
+        if #available(macOS 12.0, *) {
+            if let attributed = try? AttributedString(markdown: markdown) {
+                let nsAttr = NSAttributedString(attributed)
+                if let data = try? nsAttr.data(
+                    from: NSRange(location: 0, length: nsAttr.length),
+                    documentAttributes: [.documentType: NSAttributedString.DocumentType.html]
+                ), let rawHTML = String(data: data, encoding: .utf8) {
+                    return extractBody(from: rawHTML)
+                }
+            }
+        }
+        let escaped = markdown
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+        return "<pre>\(escaped)</pre>"
+    }
+    
+    private func extractBody(from html: String) -> String {
+        guard let bodyStartRange = html.range(of: "<body", options: .caseInsensitive),
+              let closingBracket = html[bodyStartRange.lowerBound...].firstIndex(of: ">"),
+              let bodyEndRange = html.range(of: "</body>", options: .caseInsensitive) else {
+            return html
+        }
+        let start = html.index(after: closingBracket)
+        return String(html[start..<bodyEndRange.lowerBound])
     }
     
     private func loadPreviewImage(for item: FileItem) {
@@ -882,25 +1212,65 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
     }
     
     private func loadIcon(for item: FileItem, completion: @escaping (NSImage) -> Void) {
+        // First check if item already has icon cached
         if let icon = item.icon {
             completion(icon)
             return
         }
+        
         let path = item.url.path
-        DispatchQueue.main.async {
+        let cacheKey = path as NSString
+        
+        // Check NSCache
+        if let cached = iconCache.object(forKey: cacheKey) {
+            item.icon = cached
+            completion(cached)
+            return
+        }
+        
+        // Load icon on background thread to avoid blocking UI
+        iconLoadQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            // NSWorkspace.shared.icon is thread-safe and can be called from background
             let icon = NSWorkspace.shared.icon(forFile: path)
             icon.size = NSSize(width: 16, height: 16)
+            
+            // Cache the icon
+            self.iconCache.setObject(icon, forKey: cacheKey)
             item.icon = icon
-            completion(icon)
+            
+            // Update UI on main thread
+            DispatchQueue.main.async {
+                completion(icon)
+            }
         }
     }
     
     private func loadLargeIcon(for item: FileItem, completion: @escaping (NSImage) -> Void) {
         let path = item.url.path
-        DispatchQueue.main.async {
+        let cacheKey = "\(path)-large" as NSString
+        
+        // Check cache for large icon
+        if let cached = iconCache.object(forKey: cacheKey) {
+            completion(cached)
+            return
+        }
+        
+        // Load large icon on background thread
+        iconLoadQueue.async { [weak self] in
+            guard let self = self else { return }
+            
             let icon = NSWorkspace.shared.icon(forFile: path)
             icon.size = NSSize(width: 256, height: 256)
-            completion(icon)
+            
+            // Cache the large icon
+            self.iconCache.setObject(icon, forKey: cacheKey)
+            
+            // Update UI on main thread
+            DispatchQueue.main.async {
+                completion(icon)
+            }
         }
     }
 }
@@ -978,9 +1348,11 @@ extension PreviewViewController: NSOutlineViewDelegate {
                 cellView.imageView?.image = icon
             }
         case "date":
-            cellView.textField?.stringValue = dateFormatter.string(from: fileItem.modificationDate)
+            // Use cached formatted date to avoid repeated formatting
+            cellView.textField?.stringValue = fileItem.formattedDate(using: dateFormatter)
         case "size":
-            cellView.textField?.stringValue = fileItem.isFolder ? "—" : byteFormatter.string(fromByteCount: fileItem.size)
+            // Use cached formatted size to avoid repeated formatting
+            cellView.textField?.stringValue = fileItem.formattedSize(using: byteFormatter)
         case "kind":
             cellView.textField?.stringValue = fileItem.kindDescription
         default:
@@ -991,10 +1363,20 @@ extension PreviewViewController: NSOutlineViewDelegate {
     
     func outlineView(_ outlineView: NSOutlineView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
         currentSortDescriptor = outlineView.sortDescriptors.first
-        sortFileItems(&rootItems)
-        resortDescendants(from: rootItems)
-        rebuildVisibleRootItems()
-        outlineView.reloadData()
+        
+        // Move sorting to background thread to avoid blocking UI
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            
+            self.sortFileItems(&self.rootItems)
+            self.resortDescendants(from: self.rootItems)
+            
+            DispatchQueue.main.async {
+                self.rebuildVisibleRootItems()
+                // Use targeted reload instead of full reloadData()
+                self.outlineView.reloadItem(nil, reloadChildren: true)
+            }
+        }
     }
     
     func outlineView(_ outlineView: NSOutlineView, shouldExpandItem item: Any) -> Bool {
@@ -1007,7 +1389,7 @@ extension PreviewViewController: NSOutlineViewDelegate {
     
     func outlineViewSelectionDidChange(_ notification: Notification) {
         guard notification.object as? NSOutlineView === outlineView else { return }
-        DebugLogger.shared.log("Selection changed → \(selectedItems.last?.name ?? "none")")
+        // Removed logging here to reduce overhead on every selection change
         syncPreviewWithSelection()
     }
 }
